@@ -1,6 +1,7 @@
 const scout = require('./agents/scout');
 const generator = require('./agents/generator');
 const pusher = require('./agents/pusher');
+const tester = require('./agents/tester');
 
 async function procesarFallo({ portal, ticket }) {
   console.log(`[REINO B] Procesando fallo: portal=${portal} ticket=${ticket}`);
@@ -29,12 +30,40 @@ async function procesarFallo({ portal, ticket }) {
   }
   console.log(`[REINO B] Handler pushed: commit=${pushResult.commitHash || '(sin cambios)'} files=${(pushResult.filesPushed || []).join(',') || '-'}`);
 
-  return {
-    exito: true,
-    commitHash: pushResult.commitHash,
-    filename: handler.filename,
-    filesPushed: pushResult.filesPushed
-  };
+  console.log('[REINO B] Esperando deploy de Reino C...');
+  const deployStatus = await tester.esperarDeployReinoC({ commitHashEsperado: pushResult.commitHash });
+  if (!deployStatus.ready) {
+    console.error(`[REINO B] Reino C no respondió a tiempo: ${deployStatus.error}`);
+    return { exito: false, etapa: 'esperar-deploy', error: deployStatus.error };
+  }
+
+  // Ticket de prueba (usar el ticket original que disparó el fallo)
+  const ticketPrueba = ticket || { noTicket: 'TEST-AUTO', otrosCampos: 'TBD' };
+  const testResult = await tester.probarHandler({
+    portal,
+    ticketData: ticketPrueba,
+    perfil: null
+  });
+
+  if (testResult.pasoLaPrueba) {
+    console.log(`[REINO B] ✅ Handler ${portal} pasó prueba en Reino C - LISTO PARA PROMOVER A REINO A`);
+    console.log(`[REINO B] UUID timbrado: ${testResult.body.uuid}`);
+    return {
+      exito: true,
+      etapa: 'reino-c-validado',
+      testResult,
+      commitHash: pushResult.commitHash,
+      filename: handler.filename
+    };
+  } else {
+    console.log(`[REINO B] ❌ Handler ${portal} FALLÓ en Reino C: ${JSON.stringify(testResult.body || testResult.error)}`);
+    return {
+      exito: false,
+      etapa: 'reino-c-fallo',
+      testResult,
+      commitHash: pushResult.commitHash
+    };
+  }
 }
 
 module.exports = { procesarFallo };
