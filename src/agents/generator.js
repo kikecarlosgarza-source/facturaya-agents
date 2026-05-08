@@ -11,14 +11,15 @@ const claudeApi = require('../lib/claudeApi');
 
 const execFileAsync = promisify(execFile);
 
-// Override en producción con REINO_A_HANDLERS_PATH si los handlers de Reino A
-// no están en la ruta default (e.g. clone /tmp/reino-a-readonly en Render).
-const HANDLERS_REF_DIR = process.env.REINO_A_HANDLERS_PATH ||
-  '/Users/fival020/facturasat-backend/services/handlers';
+// Refs bundleados en src/refs/. Son copias snapshot de los handlers de Reino A
+// (services/handlers/*.js) — sirven como input al prompt de Claude para que el
+// handler nuevo siga el mismo estilo. NO son ejecutables en Reino B.
+// Resync manual cuando un handler de Reino A evolucione (Reino A está LOCKED).
+const REFS_DIR = path.join(__dirname, '..', 'refs');
 
 async function leerReferencias() {
-  const refSeven = await fs.readFile(path.join(HANDLERS_REF_DIR, 'sevenelevenHandler.js'), 'utf8');
-  const refBenavides = await fs.readFile(path.join(HANDLERS_REF_DIR, 'benavidesHandler.js'), 'utf8');
+  const refSeven = await fs.readFile(path.join(REFS_DIR, 'sevenelevenHandler.ref.js'), 'utf8');
+  const refBenavides = await fs.readFile(path.join(REFS_DIR, 'benavidesHandler.ref.js'), 'utf8');
   return { refSeven, refBenavides };
 }
 
@@ -106,7 +107,7 @@ async function generarHandlerDesdeAcciones({ portal, accionesGrabadas, ticketDat
   try {
     referencias = await leerReferencias();
   } catch (err) {
-    return { error: `No se pudieron leer handlers de referencia (${HANDLERS_REF_DIR}): ${err.message}` };
+    return { error: `No se pudieron leer handlers de referencia (${REFS_DIR}): ${err.message}` };
   }
 
   const system = buildSystemPrompt(referencias.refSeven, referencias.refBenavides);
