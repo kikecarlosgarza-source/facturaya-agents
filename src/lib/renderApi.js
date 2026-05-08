@@ -4,13 +4,21 @@ const RENDER_API_BASE = 'https://api.render.com/v1';
 
 async function getRecentLogs() {
   const apiKey = process.env.RENDER_API_KEY;
+  const ownerId = process.env.OWNER_ID;
   const serviceId = process.env.BACKEND_SERVICE_ID;
-  if (!apiKey || !serviceId) {
-    throw new Error('RENDER_API_KEY o BACKEND_SERVICE_ID no configurados');
+  if (!apiKey || !ownerId || !serviceId) {
+    throw new Error('RENDER_API_KEY, OWNER_ID o BACKEND_SERVICE_ID no configurados');
   }
 
-  const url = `${RENDER_API_BASE}/services/${serviceId}/logs`;
+  const url = `${RENDER_API_BASE}/logs`;
   const resp = await axios.get(url, {
+    params: {
+      ownerId,
+      resource: serviceId,
+      type: 'app',
+      limit: 100,
+      direction: 'backward'
+    },
     headers: {
       Authorization: `Bearer ${apiKey}`,
       Accept: 'application/json'

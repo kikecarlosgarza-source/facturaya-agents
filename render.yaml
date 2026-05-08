@@ -12,5 +12,7 @@ services:
         sync: false
       - key: GITHUB_PAT
         sync: false
+      - key: OWNER_ID
+        sync: false
       - key: BACKEND_SERVICE_ID
         sync: false
