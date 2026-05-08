@@ -1,10 +1,9 @@
 services:
   - type: worker
     name: facturaya-agents
-    runtime: node
+    runtime: docker
+    dockerfilePath: ./Dockerfile
     plan: starter
-    buildCommand: npm install
-    startCommand: npm start
     envVars:
       - key: RENDER_API_KEY
         sync: false
@@ -15,4 +14,6 @@ services:
       - key: OWNER_ID
         sync: false
       - key: BACKEND_SERVICE_ID
+        sync: false
+      - key: CAPSOLVER_API_KEY
         sync: false
