@@ -1,0 +1,16 @@
+services:
+  - type: worker
+    name: facturaya-agents
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: RENDER_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GITHUB_PAT
+        sync: false
+      - key: BACKEND_SERVICE_ID
+        sync: false

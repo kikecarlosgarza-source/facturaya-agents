@@ -1,0 +1,19 @@
+{
+  "name": "facturaya-agents",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reino B — daemon de agentes AI que detecta fallos en facturasat-backend (Reino A) y los arregla automáticamente",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0",
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "playwright": "^1.48.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
