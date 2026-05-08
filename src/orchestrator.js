@@ -1,69 +1,133 @@
-const scout = require('./agents/scout');
+// Orquestador del Reino B. Flow:
+//   detector (DRY_RUN=false) → procesarFallo({portal, ticket})
+//   1. portalsLookup (override portals.json + cache + web_search Claude)
+//   2. dnsCheck (timeout corto, abortar si URL muerta)
+//   3. scoutVisual (Computer Use API loop con captura de selectores)
+//   4. Si Scout factura OK:
+//        a. generator (segundo pase a Claude text-mode → handler.js reproducible)
+//        b. pusher (modo PR contra Reino A, NUNCA push directo a main)
+//   5. Si Scout falla → log + costo + screenshots para debug humano
+
+const portalsLookup = require('./lib/portalsLookup');
+const dnsCheck = require('./lib/dnsCheck');
+const scoutVisual = require('./agents/scoutVisual');
 const generator = require('./agents/generator');
 const pusher = require('./agents/pusher');
-const tester = require('./agents/tester');
+
+// Perfil default para tickets que llegan sin perfil resuelto. Para producción,
+// orchestrator deberá enriquecer con datos reales del usuario (TODO: data wiring).
+const PERFIL_DEFAULT = {
+  rfc: 'GAME860412CY6',
+  nombre: 'ENRIQUE CARLOS GARZA MONTEMAYOR',
+  cp: '66230',
+  regimen: '612',
+  uso_cfdi: 'G03',
+  email: 'kikecarlosgarza@gmail.com'
+};
 
 async function procesarFallo({ portal, ticket }) {
   console.log(`[REINO B] Procesando fallo: portal=${portal} ticket=${ticket}`);
 
-  const urlPista = `https://www.${portal}.com/facturacion`;
-  const scoutOut = await scout.explorarPortal({ portal, urlPista });
-  if (scoutOut.error) {
-    console.error(`[REINO B] Scout falló: ${scoutOut.error}`);
-    return { exito: false, etapa: 'scout', error: scoutOut.error };
+  // 1. Resolver URL del portal
+  const urlPortal = await portalsLookup.lookupPortalUrl({ portal });
+  if (!urlPortal) {
+    console.error(`[REINO B] No se pudo resolver URL para portal=${portal}`);
+    return { exito: false, etapa: 'lookup', error: 'URL no encontrada' };
   }
-  console.log(`[REINO B] Scout OK: framework=${scoutOut.framework} inputs=${scoutOut.inputs.length} buttons=${scoutOut.buttons.length} hasCaptcha=${scoutOut.hasCaptcha}`);
+  console.log(`[REINO B] URL resuelta: ${urlPortal}`);
 
-  const handler = await generator.generarHandler({ scoutOutput: scoutOut, portalNombre: portal });
-  if (handler.error) {
-    console.error(`[REINO B] Generator falló: ${handler.error}${handler.detalle ? ' — ' + handler.detalle : ''}`);
-    return { exito: false, etapa: 'generator', error: handler.error };
+  // 2. DNS pre-check (evita gasto inútil si la URL no resuelve)
+  const dnsOk = await dnsCheck.dnsResolves(urlPortal);
+  if (!dnsOk.ok) {
+    console.error(`[REINO B] DNS no resuelve para ${urlPortal}: ${dnsOk.error}`);
+    return { exito: false, etapa: 'dns', error: dnsOk.error, url: urlPortal };
   }
-  console.log(`[REINO B] Generator OK: ${handler.filename} (${handler.contenido.length} chars)`);
+  console.log(`[REINO B] DNS OK: ${dnsOk.host}`);
 
-  let pushResult;
-  try {
-    pushResult = await pusher.commitHandler({ handler, portalNombre: portal, repoTarget: 'sandbox' });
-  } catch (err) {
-    console.error(`[REINO B] Pusher falló: ${err.message}`);
-    return { exito: false, etapa: 'pusher', error: err.message };
-  }
-  console.log(`[REINO B] Handler pushed: commit=${pushResult.commitHash || '(sin cambios)'} files=${(pushResult.filesPushed || []).join(',') || '-'}`);
+  // 3. ticketData minimal (solo conocemos el ticket id desde el log de Reino A)
+  const ticketData = {
+    numero_ticket: ticket,
+    folio: ticket,
+    total: '',
+    fecha_compra: '',
+    establecimiento: portal
+  };
 
-  console.log('[REINO B] Esperando deploy de Reino C...');
-  const deployStatus = await tester.esperarDeployReinoC({ commitHashEsperado: pushResult.commitHash });
-  if (!deployStatus.ready) {
-    console.error(`[REINO B] Reino C no respondió a tiempo: ${deployStatus.error}`);
-    return { exito: false, etapa: 'esperar-deploy', error: deployStatus.error };
-  }
-
-  // Ticket de prueba (usar el ticket original que disparó el fallo)
-  const ticketPrueba = ticket || { noTicket: 'TEST-AUTO', otrosCampos: 'TBD' };
-  const testResult = await tester.probarHandler({
+  // 4. Scout Visual
+  const resultado = await scoutVisual.explorarYFacturar({
     portal,
-    ticketData: ticketPrueba,
-    perfil: null
+    urlPortal,
+    ticketData,
+    perfil: PERFIL_DEFAULT
   });
 
-  if (testResult.pasoLaPrueba) {
-    console.log(`[REINO B] ✅ Handler ${portal} pasó prueba en Reino C - LISTO PARA PROMOVER A REINO A`);
-    console.log(`[REINO B] UUID timbrado: ${testResult.body.uuid}`);
-    return {
-      exito: true,
-      etapa: 'reino-c-validado',
-      testResult,
-      commitHash: pushResult.commitHash,
-      filename: handler.filename
-    };
-  } else {
-    console.log(`[REINO B] ❌ Handler ${portal} FALLÓ en Reino C: ${JSON.stringify(testResult.body || testResult.error)}`);
+  console.log(`[REINO B] Scout Visual costo: $${resultado.costo.costUsd} (${resultado.costo.calls} calls, ${resultado.costo.inputTokens}+${resultado.costo.outputTokens} tokens)`);
+
+  if (!resultado.exito) {
+    console.error(`[REINO B] Scout Visual falló: ${resultado.error}`);
     return {
       exito: false,
-      etapa: 'reino-c-fallo',
-      testResult,
-      commitHash: pushResult.commitHash
+      etapa: 'scout',
+      error: resultado.error,
+      costo: resultado.costo,
+      screenshots: resultado.screenshots.length
     };
   }
+
+  console.log(`[REINO B] ✅ Scout Visual OK: UUID=${resultado.uuid} (${resultado.accionesGrabadas.length} acciones grabadas)`);
+
+  // 5a. Generator: convertir acciones a handler permanente
+  const handler = await generator.generarHandlerDesdeAcciones({
+    portal,
+    accionesGrabadas: resultado.accionesGrabadas,
+    ticketData
+  });
+
+  if (handler.error) {
+    console.error(`[REINO B] Generator falló: ${handler.error}${handler.detalle ? ' — ' + handler.detalle : ''}`);
+    return {
+      exito: true,
+      etapa: 'generator-fail',
+      uuid: resultado.uuid,
+      error: handler.error,
+      costo: resultado.costo
+    };
+  }
+
+  console.log(`[REINO B] Handler generado: ${handler.filename} (${handler.contenido.length} chars)`);
+
+  // 5b. Pusher: PR contra Reino A
+  let pushResult;
+  try {
+    pushResult = await pusher.commitHandler({
+      handler,
+      portalNombre: portal,
+      repoTarget: 'production',
+      uuid: resultado.uuid,
+      screenshots: resultado.screenshots
+    });
+  } catch (err) {
+    console.error(`[REINO B] Pusher PR falló: ${err.message}`);
+    return {
+      exito: true,
+      etapa: 'pusher-fail',
+      uuid: resultado.uuid,
+      error: err.message,
+      costo: resultado.costo
+    };
+  }
+
+  console.log(`[REINO B] ✅ PR creado: ${pushResult.prUrl} (#${pushResult.prNumber}) branch=${pushResult.branch}`);
+
+  return {
+    exito: true,
+    etapa: 'complete',
+    uuid: resultado.uuid,
+    prUrl: pushResult.prUrl,
+    prNumber: pushResult.prNumber,
+    branch: pushResult.branch,
+    costo: resultado.costo
+  };
 }
 
 module.exports = { procesarFallo };

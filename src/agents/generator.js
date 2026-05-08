@@ -1,3 +1,8 @@
+// Generator — convierte accionesGrabadas (de scoutVisual) en handler permanente
+// reproducible. Segundo pase a Claude (texto, sin Computer Use): le damos los pasos
+// con selectores capturados y le pedimos que escriba código Playwright que use los
+// selectores cuando estén, fallback a coords cuando no.
+
 const fs = require('fs/promises');
 const path = require('path');
 const { execFile } = require('child_process');
@@ -6,8 +11,8 @@ const claudeApi = require('../lib/claudeApi');
 
 const execFileAsync = promisify(execFile);
 
-// Path donde generator.js lee handlers de referencia. Override en producción
-// con REINO_A_HANDLERS_PATH (por ejemplo, un clone /tmp del repo Reino A).
+// Override en producción con REINO_A_HANDLERS_PATH si los handlers de Reino A
+// no están en la ruta default (e.g. clone /tmp/reino-a-readonly en Render).
 const HANDLERS_REF_DIR = process.env.REINO_A_HANDLERS_PATH ||
   '/Users/fival020/facturasat-backend/services/handlers';
 
@@ -19,25 +24,32 @@ async function leerReferencias() {
 
 function buildSystemPrompt(refSeven, refBenavides) {
   return [
-    'Eres un agente generador de handlers JS para facturación automatizada de tickets en portales SAT-México.',
+    'Eres un agente generador de handlers JS para facturación automatizada en portales SAT-México.',
     '',
-    'CONTRATO ESTRICTO del handler que debes producir:',
+    'CONTRATO DEL HANDLER:',
     '  module.exports = { ejecutar };',
     '  async function ejecutar(perfil, ticketData) {',
-    '    // perfil: { rfc, nombre_sat, email, regimen, uso_cfdi, cp, ... }',
-    '    // ticketData: { numero_ticket, folio, monto, ... }',
-    '    // retorna: { exito: bool, uuid?: string, error?: string }',
+    '    // perfil: { rfc, nombre, email, cp, regimen, uso_cfdi, ... }',
+    '    // ticketData: { numero_ticket, folio, total, fecha_compra, ... }',
+    '    // retorna: { exito: bool, uuid?: string, mensaje?: string, error?: string }',
     '  }',
     '',
-    'REGLAS:',
-    '  - Usar Playwright stealth (require("playwright-extra") con plugin-stealth si está disponible, fallback a playwright base).',
-    '  - Logs con prefijo "[AUTO] <portal> - ..." para que el detector del Reino B los parsee.',
-    '  - Cerrar el browser en bloque finally.',
-    '  - Solo usar selectores que existan en el scoutOutput. No inventar.',
-    '  - Retornar { exito: false, error } en cualquier branch de fallo.',
-    '  - Output debe ser un único bloque ```javascript ... ``` con código completo, sin texto extra antes ni después.',
+    'INPUT QUE RECIBIRÁS:',
+    '- portal: nombre del portal',
+    '- ticketData shape esperado',
+    '- accionesGrabadas: array de pasos que un agente Computer Use ejecutó EXITOSAMENTE para timbrar una factura. Cada paso tiene { type (left_click | type | key | scroll), coord (cuando aplica), selector (capturado vía elementFromPoint, puede ser null), tag, text (con placeholders {{rfc}}/{{folio}}/etc.), wait }',
     '',
-    'HANDLER DE REFERENCIA 1 (7-Eleven, Pattern C — DataDome + Konesh + captcha):',
+    'REGLAS PARA GENERAR EL HANDLER:',
+    '- Usar Playwright stealth: require("playwright-extra") con puppeteer-extra-plugin-stealth, fallback a require("playwright") base si no está disponible.',
+    '- Para CADA paso del recording, prefiere usar el selector capturado: page.click(selector) en lugar de page.mouse.click(coord). Solo usa coords si el selector es null.',
+    '- Para "type", usa page.fill(selector, valor) si hay selector + tag input/textarea, o page.keyboard.type si no. Reemplaza placeholders del recording: {{rfc}} → perfil.rfc, {{folio}} → ticketData.folio, etc.',
+    '- Para "key", usa page.keyboard.press(key) (e.g. "Enter").',
+    '- Logs con prefijo "[AUTO] <portal> - paso N: <acción>" para que el detector del Reino B parsee.',
+    '- Cierra el browser en bloque finally.',
+    '- Retorna { exito: false, error: msg } en cualquier branch de fallo.',
+    '- Output: ÚNICO bloque ```javascript ... ``` con código completo, sin texto antes ni después.',
+    '',
+    'HANDLER DE REFERENCIA 1 (7-Eleven, Pattern C — DataDome + Konesh):',
     '```javascript',
     refSeven,
     '```',
@@ -49,16 +61,21 @@ function buildSystemPrompt(refSeven, refBenavides) {
   ].join('\n');
 }
 
-function buildUserMessage(scoutOutput, portalNombre) {
+function buildUserMessage({ portal, accionesGrabadas, ticketData }) {
   return [
-    `Genera un handler para el portal "${portalNombre}".`,
+    `Genera un handler reproducible para el portal "${portal}".`,
     '',
-    'Mapa estructural capturado por Scout:',
+    'ticketData shape esperado:',
     '```json',
-    JSON.stringify(scoutOutput, null, 2),
+    JSON.stringify(ticketData, null, 2),
     '```',
     '',
-    `Devuelve un único bloque \`\`\`javascript con el contenido completo de ${portalNombre}Handler.js.`
+    'accionesGrabadas (lo que Computer Use hizo y funcionó):',
+    '```json',
+    JSON.stringify(accionesGrabadas, null, 2),
+    '```',
+    '',
+    `Devuelve ÚNICO bloque \`\`\`javascript con el contenido completo de ${portal}Handler.js. Conserva los selectores capturados para que el handler sea estable frente a cambios de layout.`
   ].join('\n');
 }
 
@@ -80,7 +97,11 @@ async function validarSintaxis(contenido) {
   }
 }
 
-async function generarHandler({ scoutOutput, portalNombre }) {
+async function generarHandlerDesdeAcciones({ portal, accionesGrabadas, ticketData }) {
+  if (!Array.isArray(accionesGrabadas) || accionesGrabadas.length === 0) {
+    return { error: 'accionesGrabadas vacío o inválido' };
+  }
+
   let referencias;
   try {
     referencias = await leerReferencias();
@@ -89,7 +110,7 @@ async function generarHandler({ scoutOutput, portalNombre }) {
   }
 
   const system = buildSystemPrompt(referencias.refSeven, referencias.refBenavides);
-  const userMsg = buildUserMessage(scoutOutput, portalNombre);
+  const userMsg = buildUserMessage({ portal, accionesGrabadas, ticketData });
 
   let response;
   try {
@@ -104,7 +125,7 @@ async function generarHandler({ scoutOutput, portalNombre }) {
 
   const contenido = extraerCodigo(response.text);
   if (!contenido) {
-    return { error: 'No se encontró bloque ```javascript en la respuesta de Claude' };
+    return { error: 'No se encontró bloque ```javascript en respuesta de Claude' };
   }
 
   const sintaxis = await validarSintaxis(contenido);
@@ -113,9 +134,9 @@ async function generarHandler({ scoutOutput, portalNombre }) {
   }
 
   return {
-    filename: `${portalNombre}Handler.js`,
+    filename: `${portal}Handler.js`,
     contenido
   };
 }
 
-module.exports = { generarHandler };
+module.exports = { generarHandlerDesdeAcciones };
