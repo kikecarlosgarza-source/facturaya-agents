@@ -118,6 +118,36 @@ function placeholderize(text, ctx) {
   return result;
 }
 
+// Mapping de teclas que Claude API devuelve (formato xdotool/CapsLowerCase)
+// a los valores que Playwright espera. Sin esto, page.keyboard.press("ctrl+Tab")
+// silencia el comando — Playwright requiere "Control+Tab".
+const KEY_NORMALIZE = {
+  ctrl: 'Control', control: 'Control',
+  alt: 'Alt',
+  shift: 'Shift',
+  cmd: 'Meta', meta: 'Meta', super: 'Meta', win: 'Meta',
+  enter: 'Enter', return: 'Enter',
+  tab: 'Tab',
+  escape: 'Escape', esc: 'Escape',
+  backspace: 'Backspace',
+  delete: 'Delete', del: 'Delete',
+  space: 'Space',
+  up: 'ArrowUp', arrowup: 'ArrowUp',
+  down: 'ArrowDown', arrowdown: 'ArrowDown',
+  left: 'ArrowLeft', arrowleft: 'ArrowLeft',
+  right: 'ArrowRight', arrowright: 'ArrowRight',
+  home: 'Home', end: 'End',
+  pageup: 'PageUp', pagedown: 'PageDown'
+};
+
+function normalizarTeclas(text) {
+  if (!text) return text;
+  return String(text).split('+').map(part => {
+    const lower = part.toLowerCase().trim();
+    return KEY_NORMALIZE[lower] || part;
+  }).join('+');
+}
+
 async function ejecutarAccion(page, input) {
   const action = input.action;
   console.log('[REINO B - scoutVisual] ejecutando:', action, JSON.stringify(input).substring(0, 100));
@@ -145,10 +175,13 @@ async function ejecutarAccion(page, input) {
       await page.keyboard.type(input.text, { delay: 50 });
       await sleep(300);
       break;
-    case 'key':
-      await page.keyboard.press(input.text || input.key);
+    case 'key': {
+      const rawKey = input.text || input.key;
+      const normalized = normalizarTeclas(rawKey);
+      await page.keyboard.press(normalized);
       await sleep(300);
       break;
+    }
     case 'scroll': {
       const dir = input.scroll_direction || input.direction;
       const amt = input.scroll_amount || 3;
@@ -426,7 +459,7 @@ async function explorarYFacturar({ portal, urlPortal, ticketData, perfil }) {
           } else if (action === 'key') {
             accionesGrabadas.push({
               type: 'key',
-              key: input.text || input.key,
+              key: normalizarTeclas(input.text || input.key),
               wait: 300
             });
           } else if (action === 'scroll') {
