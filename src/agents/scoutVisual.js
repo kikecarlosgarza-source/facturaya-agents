@@ -1,10 +1,13 @@
-// Scout Visual — Computer Use API agent.
-// Adaptado de Reino A services/agentService.js. Cambios principales:
-//   - Modelo Opus 4.7 (vs Sonnet 4.6), enable_zoom:true, MAX 50 (vs 20)
-//   - Sin SQLite — devuelve { exito, uuid, accionesGrabadas, screenshots, costo }
-//   - Cost tracker $5 cap, captcha pre-resolve via CapSolver
-//   - finish_task tool custom para señal explícita
-//   - playwright-extra + stealth (con fallback a playwright base)
+// Scout DOM-based con Playwright.
+// Reemplaza el scout Computer Use anterior (coordenadas + screenshots) por
+// un loop donde:
+//   1. Playwright extrae DOM estructurado (inputs, buttons, selects, links)
+//   2. Se manda a Claude como JSON con selectors CSS reales
+//   3. Claude responde { action, selector, value } o llama finish_task
+//   4. Playwright ejecuta por selector
+//
+// Costo típico: $0.30-0.80 por scout (vs $5 con Computer Use)
+// Confiabilidad: alta — Claude trabaja con DOM real, no adivina coordenadas
 
 const claudeApi = require('../lib/claudeApi');
 const portalHints = require('../lib/portalHints');
@@ -13,25 +16,51 @@ const { createCostTracker } = require('../lib/costTracker');
 
 const VIEWPORT = { width: 1280, height: 800 };
 const MODEL = 'claude-opus-4-7';
-const BETA = 'computer-use-2025-11-24';
-const TOOL_TYPE = 'computer_20251124';
-const MAX_ITER = 50;
-const COST_CAP_USD = 5;
-const ACTION_DELAY_MS = 1500;
-const RATE_LIMIT_SLEEP_MS = 3000;
+const MAX_ITER = 30;
+const COST_CAP_USD = 3;
+const ACTION_DELAY_MS = 800;
+const MAX_ELEMENTS_PER_FRAME = 80;
 
 const FINISH_TOOL = {
   name: 'finish_task',
-  description: 'Llama esto cuando termines la facturación: éxito con UUID timbrado o fallo definitivo. Tras llamarlo, ya no puedes hacer más acciones.',
+  description: 'Llamar cuando termines: éxito con UUID/folio del CFDI, o fallo. Tras llamarlo no hay más acciones.',
   input_schema: {
     type: 'object',
     properties: {
       exito: { type: 'boolean' },
-      uuid: { type: 'string', description: 'UUID del CFDI timbrado (folio fiscal). Vacío si exito=false.' },
-      error: { type: 'string', description: 'Descripción del fallo si exito=false.' },
-      resumen: { type: 'string', description: 'Una línea explicando qué se logró/intentó.' }
+      uuid: { type: 'string', description: 'Folio fiscal del CFDI o UUID. Vacío si exito=false.' },
+      error: { type: 'string', description: 'Descripción del fallo.' },
+      resumen: { type: 'string', description: 'Una línea explicando qué se logró.' }
     },
     required: ['exito']
+  }
+};
+
+const ACTION_TOOL = {
+  name: 'browser_action',
+  description: 'Ejecutar una acción sobre un elemento del DOM. Usar el selector exacto que aparece en la lista de elementos disponibles.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      action: {
+        type: 'string',
+        enum: ['click', 'fill', 'select', 'press', 'wait', 'goto'],
+        description: 'click: clickear un botón/link. fill: escribir en un input/textarea. select: elegir opción de un <select>. press: presionar tecla (Enter/Tab). wait: esperar N ms. goto: navegar a URL.'
+      },
+      selector: {
+        type: 'string',
+        description: 'CSS selector del elemento. Copiarlo EXACTO de la lista de elementos.'
+      },
+      value: {
+        type: 'string',
+        description: 'Para fill: texto a escribir. Para select: option value o label. Para press: nombre de tecla (Enter/Tab). Para wait: ms. Para goto: URL.'
+      },
+      reason: {
+        type: 'string',
+        description: 'Una línea explicando por qué esta acción (para debug y handler reproducible).'
+      }
+    },
+    required: ['action', 'reason']
   }
 };
 
@@ -42,73 +71,30 @@ async function loadChromium() {
     const playwrightExtra = require('playwright-extra');
     const stealth = require('puppeteer-extra-plugin-stealth')();
     playwrightExtra.chromium.use(stealth);
-    console.log('[REINO B - scoutVisual] usando playwright-extra + stealth');
+    console.log('[REINO B - scout] usando playwright-extra + stealth');
     return playwrightExtra.chromium;
   } catch (e) {
-    console.warn(`[REINO B - scoutVisual] playwright-extra no disponible (${e.message}), usando playwright base`);
+    console.warn(`[REINO B - scout] playwright-extra no disponible (${e.message}), usando playwright base`);
     return require('playwright').chromium;
   }
 }
 
-// Captura el selector CSS del elemento en (x,y). Patrón portado de
-// Reino A agentService.js. Hace match por id > [name] > tag.class:nth-of-type
-// con path de máx 4 niveles. Esto permite que el handler reproducible no
-// dependa de coordenadas absolutas frágiles.
-async function captureSelectorAt(page, coord) {
-  if (!Array.isArray(coord)) return { selector: null, tag: null };
-  try {
-    const info = await page.evaluate(([x, y]) => {
-      const el = document.elementFromPoint(x, y);
-      if (!el) return null;
-      function escId(s) { try { return CSS.escape(s); } catch { return s; } }
-      function build(e) {
-        if (e.id) return '#' + escId(e.id);
-        const name = e.getAttribute && e.getAttribute('name');
-        if (name) return e.tagName.toLowerCase() + '[name="' + String(name).replace(/"/g, '\\"') + '"]';
-        const path = [];
-        let cur = e;
-        while (cur && cur.nodeType === 1 && cur !== document.body) {
-          let part = cur.tagName.toLowerCase();
-          const cls = (cur.className && typeof cur.className === 'string') ? cur.className : '';
-          if (cls) {
-            const c = cls.split(/\s+/).filter(Boolean).slice(0, 2).map(escId).join('.');
-            if (c) part += '.' + c;
-          }
-          const parent = cur.parentNode;
-          if (parent && parent.children) {
-            const same = Array.from(parent.children).filter(s => s.tagName === cur.tagName);
-            if (same.length > 1) part += ':nth-of-type(' + (same.indexOf(cur) + 1) + ')';
-          }
-          path.unshift(part);
-          if (path.length > 4) break;
-          cur = cur.parentNode;
-        }
-        return path.join(' > ');
-      }
-      return { selector: build(el), tag: el.tagName };
-    }, coord);
-    return info || { selector: null, tag: null };
-  } catch {
-    return { selector: null, tag: null };
-  }
-}
-
-// Reemplaza valores literales (rfc, folio, etc.) por placeholders en el text
-// grabado, para que el handler reproducible inyecte datos del perfil/ticket
-// en lugar de los valores específicos de esta sesión.
+// Reemplaza valores del ticket/perfil por placeholders {{rfc}}, {{folio}}, etc.
+// Se usa al grabar acciones para que el handler reproducible inyecte datos
+// del perfil del próximo ticket en lugar de los valores literales de esta sesión.
 function placeholderize(text, ctx) {
   if (!text) return text;
   let result = String(text);
   const subs = [
-    ['{{folio}}',    String(ctx.folio || '')],
-    ['{{rfc}}',      ctx.perfil.rfc || ''],
-    ['{{nombre}}',   ctx.perfil.nombre || ''],
-    ['{{cp}}',       ctx.perfil.cp || ''],
-    ['{{email}}',    ctx.perfil.email || ''],
-    ['{{regimen}}',  ctx.perfil.regimen || ''],
+    ['{{folio}}', String(ctx.folio || '')],
+    ['{{rfc}}', ctx.perfil.rfc || ''],
+    ['{{nombre}}', ctx.perfil.nombre || ''],
+    ['{{cp}}', ctx.perfil.cp || ''],
+    ['{{email}}', ctx.perfil.email || ''],
+    ['{{regimen}}', ctx.perfil.regimen || ''],
     ['{{uso_cfdi}}', ctx.perfil.uso_cfdi || ''],
-    ['{{total}}',    String(ctx.total || '')],
-    ['{{fecha}}',    String(ctx.fecha || '')]
+    ['{{total}}', String(ctx.total || '')],
+    ['{{fecha}}', String(ctx.fecha || '')]
   ].filter(([, v]) => v && v.length >= 2)
    .sort((a, b) => b[1].length - a[1].length);
   for (const [ph, val] of subs) {
@@ -118,102 +104,11 @@ function placeholderize(text, ctx) {
   return result;
 }
 
-// Mapping de teclas que Claude API devuelve (formato xdotool/CapsLowerCase)
-// a los valores que Playwright espera. Sin esto, page.keyboard.press("ctrl+Tab")
-// silencia el comando — Playwright requiere "Control+Tab".
-const KEY_NORMALIZE = {
-  ctrl: 'Control', control: 'Control',
-  alt: 'Alt',
-  shift: 'Shift',
-  cmd: 'Meta', meta: 'Meta', super: 'Meta', win: 'Meta',
-  enter: 'Enter', return: 'Enter',
-  tab: 'Tab',
-  escape: 'Escape', esc: 'Escape',
-  backspace: 'Backspace',
-  delete: 'Delete', del: 'Delete',
-  space: 'Space',
-  up: 'ArrowUp', arrowup: 'ArrowUp',
-  down: 'ArrowDown', arrowdown: 'ArrowDown',
-  left: 'ArrowLeft', arrowleft: 'ArrowLeft',
-  right: 'ArrowRight', arrowright: 'ArrowRight',
-  home: 'Home', end: 'End',
-  pageup: 'PageUp', pagedown: 'PageDown'
-};
-
-function normalizarTeclas(text) {
-  if (!text) return text;
-  return String(text).split('+').map(part => {
-    const lower = part.toLowerCase().trim();
-    return KEY_NORMALIZE[lower] || part;
-  }).join('+');
-}
-
-async function ejecutarAccion(page, input) {
-  const action = input.action;
-  console.log('[REINO B - scoutVisual] ejecutando:', action, JSON.stringify(input).substring(0, 100));
-
-  switch (action) {
-    case 'screenshot':
-      break;
-    case 'left_click':
-      await page.mouse.click(input.coordinate[0], input.coordinate[1]);
-      await sleep(800);
-      break;
-    case 'right_click':
-      await page.mouse.click(input.coordinate[0], input.coordinate[1], { button: 'right' });
-      await sleep(500);
-      break;
-    case 'double_click':
-      await page.mouse.dblclick(input.coordinate[0], input.coordinate[1]);
-      await sleep(500);
-      break;
-    case 'triple_click':
-      await page.mouse.click(input.coordinate[0], input.coordinate[1], { clickCount: 3 });
-      await sleep(500);
-      break;
-    case 'type':
-      await page.keyboard.type(input.text, { delay: 50 });
-      await sleep(300);
-      break;
-    case 'key': {
-      const rawKey = input.text || input.key;
-      const normalized = normalizarTeclas(rawKey);
-      await page.keyboard.press(normalized);
-      await sleep(300);
-      break;
-    }
-    case 'scroll': {
-      const dir = input.scroll_direction || input.direction;
-      const amt = input.scroll_amount || 3;
-      if (Array.isArray(input.coordinate)) {
-        await page.mouse.move(input.coordinate[0], input.coordinate[1]);
-      }
-      const dy = (dir === 'up' ? -1 : 1) * amt * 100;
-      const dx = (dir === 'left' ? -1 : (dir === 'right' ? 1 : 0)) * amt * 100;
-      await page.mouse.wheel(dx, dy);
-      await sleep(300);
-      break;
-    }
-    case 'mouse_move':
-      await page.mouse.move(input.coordinate[0], input.coordinate[1]);
-      break;
-    case 'wait':
-      await sleep(Math.min((input.duration || 1) * 1000, 5000));
-      break;
-    default:
-      console.log(`[REINO B - scoutVisual] acción no implementada: ${action}`);
-  }
-}
-
 async function tomarScreenshotBase64(page) {
   const buf = await page.screenshot({ type: 'jpeg', quality: 50, fullPage: false });
   return buf.toString('base64');
 }
 
-// Pre-resolución de captcha: si hay <img id*=Kaptcha> visible al cargar,
-// lo descargamos y resolvemos con CapSolver antes del loop. El texto se
-// inyecta como hint en el primer mensaje para que Claude lo use cuando
-// llegue al campo correspondiente.
 async function detectarYResolverCaptcha(page) {
   const captchaInfo = await page.evaluate(() => {
     const selectores = ['#Kaptcha', '#captcha', 'img[id*="aptcha" i]'];
@@ -227,19 +122,155 @@ async function detectarYResolverCaptcha(page) {
   });
   if (!captchaInfo) return null;
 
-  console.log(`[REINO B - scoutVisual] captcha detectado en ${captchaInfo.selector}, pre-resolviendo via CapSolver`);
+  console.log(`[REINO B - scout] captcha detectado en ${captchaInfo.selector}, pre-resolviendo via CapSolver`);
   try {
     const kaptchaResp = await page.request.get(captchaInfo.src);
     const buf = await kaptchaResp.body();
     if (buf.length < 500) {
-      console.warn(`[REINO B - scoutVisual] captcha image sospechosamente pequeña (${buf.length} bytes), skip`);
+      console.warn(`[REINO B - scout] captcha image sospechosamente pequeña (${buf.length} bytes), skip`);
       return null;
     }
     const texto = await capsolver.resolverKaptcha(buf.toString('base64'));
     return { selector: captchaInfo.selector, texto };
   } catch (err) {
-    console.warn(`[REINO B - scoutVisual] CapSolver pre-resolve falló: ${err.message}`);
+    console.warn(`[REINO B - scout] CapSolver pre-resolve falló: ${err.message}`);
     return null;
+  }
+}
+
+// Extrae los elementos interactivos visibles del DOM con CSS selectors estables.
+// Limita a MAX_ELEMENTS_PER_FRAME para no saturar el contexto del modelo.
+async function extraerDOM(page) {
+  return await page.evaluate((max) => {
+    function escId(s) { try { return CSS.escape(s); } catch { return s; } }
+
+    function buildSelector(el) {
+      if (el.id) return '#' + escId(el.id);
+      const name = el.getAttribute('name');
+      if (name) return `${el.tagName.toLowerCase()}[name="${name.replace(/"/g, '\\"')}"]`;
+      // Path con clases (max 4 niveles)
+      const path = [];
+      let cur = el;
+      while (cur && cur.nodeType === 1 && cur !== document.body && path.length < 4) {
+        let part = cur.tagName.toLowerCase();
+        const cls = (typeof cur.className === 'string') ? cur.className : '';
+        if (cls) {
+          const c = cls.split(/\s+/).filter(Boolean).slice(0, 2).map(escId).join('.');
+          if (c) part += '.' + c;
+        }
+        const parent = cur.parentNode;
+        if (parent && parent.children) {
+          const same = Array.from(parent.children).filter(s => s.tagName === cur.tagName);
+          if (same.length > 1) part += `:nth-of-type(${same.indexOf(cur) + 1})`;
+        }
+        path.unshift(part);
+        cur = cur.parentNode;
+      }
+      return path.join(' > ');
+    }
+
+    function isVisible(el) {
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+      return r.top < window.innerHeight && r.bottom > 0 && r.left < window.innerWidth && r.right > 0;
+    }
+
+    function textoVisible(el) {
+      let t = (el.innerText || el.textContent || '').trim();
+      if (t.length > 80) t = t.substring(0, 77) + '...';
+      return t;
+    }
+
+    const selectores = 'input, textarea, select, button, a[href], [role="button"], [role="link"], [role="checkbox"], [role="radio"], label';
+    const elementos = Array.from(document.querySelectorAll(selectores))
+      .filter(isVisible)
+      .slice(0, max);
+
+    return elementos.map(el => {
+      const info = {
+        selector: buildSelector(el),
+        tag: el.tagName.toLowerCase(),
+        type: el.type || null,
+        placeholder: el.placeholder || null,
+        name: el.getAttribute('name') || null,
+        value: (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') ? (el.value || '').substring(0, 40) : null,
+        text: textoVisible(el),
+        ariaLabel: el.getAttribute('aria-label') || null,
+        required: el.required || el.getAttribute('aria-required') === 'true' || null
+      };
+      // Si es <select>, agregar las opciones
+      if (el.tagName === 'SELECT') {
+        info.options = Array.from(el.options).slice(0, 50).map(o => ({
+          value: o.value,
+          label: (o.textContent || '').trim().substring(0, 60)
+        }));
+      }
+      // Limpiar nulls
+      return Object.fromEntries(Object.entries(info).filter(([, v]) => v !== null && v !== ''));
+    });
+  }, MAX_ELEMENTS_PER_FRAME);
+}
+
+// Mensajes de error visibles en la página (rojo, alertas, validaciones)
+async function extraerMensajesError(page) {
+  return await page.evaluate(() => {
+    const selectores = '[class*="error" i], [class*="alert" i], [role="alert"], .invalid-feedback, [class*="invalid" i]';
+    return Array.from(document.querySelectorAll(selectores))
+      .filter(el => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      })
+      .map(el => (el.innerText || el.textContent || '').trim())
+      .filter(t => t.length > 0 && t.length < 200)
+      .slice(0, 10);
+  });
+}
+
+async function ejecutarAccionDOM(page, accion, ctx) {
+  const { action, selector, value, reason } = accion;
+  console.log(`[REINO B - scout] ${action} ${selector || ''} value="${(value || '').substring(0, 40)}" — ${reason}`);
+
+  switch (action) {
+    case 'click': {
+      const locator = page.locator(selector).first();
+      await locator.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+      await locator.click({ timeout: 5000 });
+      return { type: 'click', selector, reason, wait: 800 };
+    }
+    case 'fill': {
+      const locator = page.locator(selector).first();
+      await locator.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+      await locator.fill(String(value || ''));
+      return { type: 'fill', selector, value: placeholderize(value, ctx), reason, wait: 300 };
+    }
+    case 'select': {
+      const locator = page.locator(selector).first();
+      await locator.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+      // Probar por value primero, después por label
+      try {
+        await locator.selectOption({ value: String(value) });
+      } catch {
+        await locator.selectOption({ label: String(value) });
+      }
+      return { type: 'select', selector, value: placeholderize(value, ctx), reason, wait: 500 };
+    }
+    case 'press': {
+      await page.keyboard.press(String(value || 'Enter'));
+      return { type: 'press', key: value, reason, wait: 500 };
+    }
+    case 'wait': {
+      const ms = Math.min(Number(value) || 1000, 5000);
+      await sleep(ms);
+      return { type: 'wait', ms, reason };
+    }
+    case 'goto': {
+      await page.goto(String(value), { waitUntil: 'domcontentloaded', timeout: 30000 });
+      return { type: 'goto', url: value, reason, wait: 2000 };
+    }
+    default:
+      throw new Error(`Acción desconocida: ${action}`);
   }
 }
 
@@ -272,65 +303,58 @@ async function explorarYFacturar({ portal, urlPortal, ticketData, perfil }) {
     const chromium = await loadChromium();
     browser = await chromium.launch({
       headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        `--window-size=${VIEWPORT.width},${VIEWPORT.height}`
-      ]
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', `--window-size=${VIEWPORT.width},${VIEWPORT.height}`]
     });
     const context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
       viewport: VIEWPORT
     });
     const page = await context.newPage();
-
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
 
-    console.log(`[REINO B - scoutVisual] navigating to ${urlPortal}`);
+    console.log(`[REINO B - scout] navigating to ${urlPortal}`);
     await page.goto(urlPortal, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await sleep(3000);
+    await sleep(2500);
 
     const captchaInfo = await detectarYResolverCaptcha(page);
     const hintDominio = portalHints.buildHintForPortal(urlPortal, ctx);
-    const hintCaptcha = captchaInfo
-      ? `\nCAPTCHA DETECTADO en ${captchaInfo.selector}: el texto del captcha ya está pre-resuelto = "${captchaInfo.texto}". Cuando llegues al campo del captcha, escribe ese valor exacto.\n`
+    const captchaHint = captchaInfo
+      ? `\nCAPTCHA pre-resuelto = "${captchaInfo.texto}". Usalo cuando llegues al campo del captcha.\n`
       : '';
 
-    const messages = [{
-      role: 'user',
-      content: [{
-        type: 'text',
-        text: 'Completa la solicitud de factura electrónica en este portal.\n\n' +
-          hintDominio +
-          hintCaptcha +
-          'DATOS DEL TICKET:\n' +
-          `- Folio/Orden: ${ctx.folio}\n` +
-          `- Total: $${ctx.total}\n` +
-          `- Fecha: ${ctx.fecha}\n\n` +
-          'DATOS FISCALES:\n' +
-          `- RFC: ${ctx.perfil.rfc}\n` +
-          `- Nombre: ${ctx.perfil.nombre}\n` +
-          `- CP: ${ctx.perfil.cp}\n` +
-          `- Email: ${ctx.perfil.email}\n` +
-          `- Régimen fiscal: ${ctx.perfil.regimen}\n` +
-          `- Uso CFDI: ${ctx.perfil.uso_cfdi}\n\n` +
-          'Toma un screenshot para ver el estado actual y comienza. Cuando termines la facturación o detectes que es imposible, llama al tool finish_task con el UUID timbrado y exito=true. Si fallas definitivamente, llama finish_task con exito=false y un error descriptivo.'
-      }]
-    }];
+    const systemPrompt = `Sos un agente que completa portales de facturación CFDI en México.
 
-    const tools = [
-      {
-        type: TOOL_TYPE,
-        name: 'computer',
-        display_width_px: VIEWPORT.width,
-        display_height_px: VIEWPORT.height,
-        enable_zoom: true
-      },
-      FINISH_TOOL
-    ];
+REGLA #1: En cada turno te paso una lista de elementos visibles del DOM (inputs, buttons, selects, etc) con sus CSS selectors EXACTOS. Vos elegís UN elemento y UNA acción. NUNCA inventes un selector — siempre copialo de la lista que te paso.
+
+REGLA #2: Para escribir en un input usá action="fill" con selector + value. Para clickear botón/link usá action="click" con selector. Para elegir opción de <select> usá action="select" con selector + value (probá value primero, después label).
+
+REGLA #3: Si ves un mensaje de error en pantalla, intentá corregir (probablemente escribiste algo mal en el último campo). Si el error persiste, llamá finish_task con exito=false.
+
+REGLA #4: El portal NO siempre acepta cualquier régimen fiscal + uso CFDI. Si el portal rechaza por "régimen inválido", probá con régimen "612" + uso "G03". Si rechaza por "nombre fiscal no coincide", abortá con finish_task exito=false y error claro.
+
+REGLA #5: Si reconocés que estás en la pantalla final con un folio fiscal / UUID timbrado / mensaje "Factura generada exitosamente", llamá finish_task con exito=true y el UUID. NUNCA inventes un UUID.
+
+DATOS DEL TICKET ACTUAL:
+- Folio del ticket de compra: ${ctx.folio}
+- Total: $${ctx.total}
+- Fecha: ${ctx.fecha}
+- Número de tienda: ${ctx.numero_tienda || 'N/A'}
+- Establecimiento: ${ctx.establecimiento}
+
+DATOS FISCALES DEL CLIENTE:
+- RFC: ${ctx.perfil.rfc}
+- Nombre fiscal: ${ctx.perfil.nombre}
+- CP: ${ctx.perfil.cp}
+- Email: ${ctx.perfil.email}
+- Régimen fiscal: ${ctx.perfil.regimen}
+- Uso CFDI: ${ctx.perfil.uso_cfdi}
+
+${hintDominio}
+${captchaHint}`;
+
+    const messages = [];
 
     let iter = 0;
     let resultado = null;
@@ -340,43 +364,41 @@ async function explorarYFacturar({ portal, urlPortal, ticketData, perfil }) {
 
       if (!cost.puedeContinuar()) {
         const stats = cost.getStats();
-        console.warn(`[REINO B - scoutVisual] cost cap $${stats.capUsd} alcanzado en iter ${iter}: $${stats.costUsd}`);
+        console.warn(`[REINO B - scout] cost cap $${stats.capUsd} alcanzado en iter ${iter}: $${stats.costUsd}`);
         resultado = { exito: false, error: `cost cap $${stats.capUsd} alcanzado` };
         break;
       }
 
-      await sleep(RATE_LIMIT_SLEEP_MS);
-      console.log(`[REINO B - scoutVisual] iter ${iter}/${MAX_ITER}`);
+      console.log(`[REINO B - scout] iter ${iter}/${MAX_ITER}`);
 
-      // Asegurar que el último user msg tenga screenshot si no hay tool_result
-      const ultimoMsg = messages[messages.length - 1];
-      if (ultimoMsg.role === 'user' && Array.isArray(ultimoMsg.content)) {
-        const tieneToolResult = ultimoMsg.content.some(c => c.type === 'tool_result');
-        const tieneImagen = ultimoMsg.content.some(c => c.type === 'image');
-        if (!tieneToolResult && !tieneImagen) {
-          const sc = await tomarScreenshotBase64(page);
-          ultimoMsg.content.push({
-            type: 'image',
-            source: { type: 'base64', media_type: 'image/jpeg', data: sc }
-          });
-          if (screenshots.length < 5) screenshots.push({ iter, base64: sc });
-        }
-      }
+      // Extraer DOM + errores
+      const elementos = await extraerDOM(page);
+      const erroresVisibles = await extraerMensajesError(page);
+      const urlActual = page.url();
+
+      const turnoText = `URL actual: ${urlActual}\n\n` +
+        (erroresVisibles.length > 0 ? `ERRORES VISIBLES EN PANTALLA:\n${erroresVisibles.map(e => '- ' + e).join('\n')}\n\n` : '') +
+        `ELEMENTOS DISPONIBLES (${elementos.length}):\n` +
+        JSON.stringify(elementos, null, 2);
+
+      messages.push({ role: 'user', content: turnoText });
 
       let respuesta;
       try {
         respuesta = await claudeApi.chatBeta({
           model: MODEL,
+          system: systemPrompt,
           messages,
-          tools,
-          betas: [BETA],
-          maxTokens: 4096
+          tools: [ACTION_TOOL, FINISH_TOOL],
+          betas: [],
+          maxTokens: 1024
         });
       } catch (err) {
         const status = err.status || err.response?.status;
         if (status === 429) {
-          console.log('[REINO B - scoutVisual] rate limit 429, esperando 60s');
+          console.log('[REINO B - scout] rate limit 429, esperando 60s');
           await sleep(60000);
+          messages.pop();
           continue;
         }
         throw err;
@@ -385,12 +407,11 @@ async function explorarYFacturar({ portal, urlPortal, ticketData, perfil }) {
       cost.addUsage(respuesta.usage);
       messages.push({ role: 'assistant', content: respuesta.content });
 
-      const toolUseBlocks = (respuesta.content || []).filter(b => b.type === 'tool_use');
+      const toolUses = (respuesta.content || []).filter(b => b.type === 'tool_use');
 
-      // finish_task → terminar
-      const finishCall = toolUseBlocks.find(b => b.name === 'finish_task');
+      const finishCall = toolUses.find(b => b.name === 'finish_task');
       if (finishCall) {
-        console.log(`[REINO B - scoutVisual] finish_task: ${JSON.stringify(finishCall.input)}`);
+        console.log(`[REINO B - scout] finish_task: ${JSON.stringify(finishCall.input)}`);
         resultado = {
           exito: !!finishCall.input.exito,
           uuid: finishCall.input.uuid || null,
@@ -400,98 +421,49 @@ async function explorarYFacturar({ portal, urlPortal, ticketData, perfil }) {
         break;
       }
 
-      // stop_reason !== 'tool_use' sin finish_task → fallback heurístico
-      if (respuesta.stop_reason !== 'tool_use') {
-        const textoFinal = respuesta.content.filter(b => b.type === 'text').map(b => b.text).join('');
-        console.log(`[REINO B - scoutVisual] stop_reason=${respuesta.stop_reason}, texto: ${textoFinal.substring(0, 200)}`);
-        const cuerpo = await page.textContent('body').catch(() => '');
-        const exitoso = /exit|complet|factura/i.test(textoFinal) ||
-                        /exitosa|enviada|generada/i.test(cuerpo);
-        resultado = {
-          exito: exitoso,
-          uuid: null,
-          error: exitoso ? null : 'Claude terminó sin llamar finish_task'
-        };
+      const actionCall = toolUses.find(b => b.name === 'browser_action');
+      if (!actionCall) {
+        const texto = respuesta.content.filter(b => b.type === 'text').map(b => b.text).join('');
+        console.warn(`[REINO B - scout] stop sin tool_use, texto: ${texto.substring(0, 200)}`);
+        resultado = { exito: false, error: 'modelo terminó sin acción ni finish_task' };
         break;
       }
 
-      // Procesar acciones del computer tool
-      const toolResults = [];
-      for (const block of toolUseBlocks) {
-        if (block.name !== 'computer') continue;
-        const input = block.input;
-        const action = input.action;
-
-        let resultadoBlock;
-        if (action === 'screenshot') {
-          await sleep(1000);
-          const sc = await tomarScreenshotBase64(page);
-          if (screenshots.length < 5) screenshots.push({ iter, base64: sc });
-          resultadoBlock = [{
-            type: 'image',
-            source: { type: 'base64', media_type: 'image/jpeg', data: sc }
-          }];
-        } else {
-          const isClick = action === 'left_click' || action === 'right_click' ||
-                          action === 'double_click' || action === 'triple_click';
-          let selectorInfo = { selector: null, tag: null };
-          if (isClick) {
-            selectorInfo = await captureSelectorAt(page, input.coordinate);
-          }
-
-          await ejecutarAccion(page, input);
-          await sleep(ACTION_DELAY_MS);
-
-          if (isClick) {
-            accionesGrabadas.push({
-              type: action,
-              coord: input.coordinate,
-              selector: selectorInfo.selector,
-              tag: selectorInfo.tag,
-              wait: 800
-            });
-          } else if (action === 'type') {
-            accionesGrabadas.push({
-              type: 'type',
-              text: placeholderize(input.text, ctx),
-              wait: 300
-            });
-          } else if (action === 'key') {
-            accionesGrabadas.push({
-              type: 'key',
-              key: normalizarTeclas(input.text || input.key),
-              wait: 300
-            });
-          } else if (action === 'scroll') {
-            accionesGrabadas.push({
-              type: 'scroll',
-              coord: input.coordinate,
-              direction: input.scroll_direction || input.direction,
-              amount: input.scroll_amount,
-              wait: 300
-            });
-          }
-
-          const sc = await tomarScreenshotBase64(page);
-          if (screenshots.length < 5) screenshots.push({ iter, base64: sc });
-          resultadoBlock = [{
-            type: 'image',
-            source: { type: 'base64', media_type: 'image/jpeg', data: sc }
-          }];
-        }
-
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: block.id,
-          content: resultadoBlock
-        });
+      let resultadoBlock;
+      try {
+        const grabada = await ejecutarAccionDOM(page, actionCall.input, ctx);
+        accionesGrabadas.push(grabada);
+        await sleep(ACTION_DELAY_MS);
+        resultadoBlock = `Acción ejecutada OK: ${actionCall.input.action} ${actionCall.input.selector || ''}`;
+      } catch (err) {
+        console.warn(`[REINO B - scout] acción falló: ${err.message}`);
+        resultadoBlock = `Acción FALLÓ: ${err.message}. Probá otro selector de la lista.`;
       }
 
-      messages.push({ role: 'user', content: toolResults });
+      messages.push({
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: actionCall.id,
+          content: resultadoBlock
+        }]
+      });
+
+      // Screenshot cada 5 iter para debug
+      if (iter % 5 === 0 && screenshots.length < 5) {
+        const sc = await tomarScreenshotBase64(page);
+        screenshots.push({ iter, base64: sc });
+      }
     }
 
     if (!resultado) {
       resultado = { exito: false, error: `MAX_ITER ${MAX_ITER} alcanzado sin finish_task` };
+    }
+
+    // Screenshot final
+    if (screenshots.length < 5) {
+      const sc = await tomarScreenshotBase64(page);
+      screenshots.push({ iter: 'final', base64: sc });
     }
 
     return {
@@ -501,7 +473,7 @@ async function explorarYFacturar({ portal, urlPortal, ticketData, perfil }) {
       costo: cost.getStats()
     };
   } catch (err) {
-    console.error(`[REINO B - scoutVisual] error: ${err.message}`);
+    console.error(`[REINO B - scout] error: ${err.message}`);
     return {
       exito: false,
       uuid: null,
