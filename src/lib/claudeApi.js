@@ -59,7 +59,7 @@ async function chatBeta({ system, messages, tools, betas, model = 'claude-opus-4
       const params = { model, max_tokens: maxTokens, messages };
       if (system) params.system = system;
       if (tools) params.tools = tools;
-      if (betas) params.betas = betas;
+      if (betas && betas.length > 0) params.betas = betas;
 
       const resp = await client.beta.messages.create(params);
       const text = (resp.content || [])
