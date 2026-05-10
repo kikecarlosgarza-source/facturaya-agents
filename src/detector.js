@@ -31,6 +31,19 @@ const VENTANA_MAX = 30;
 
 const procesados = new Set();
 
+// Cursor en memoria: solo procesa logs con timestamp > este valor.
+// Inicializa al arrancar con (ahora - 5min) para evitar reprocesar logs viejos
+// post-reinicio. Se actualiza después de cada scanLogs.
+let lastProcessedTimestamp = Date.now() - 5 * 60 * 1000;
+
+function entryTimestampMs(entry) {
+  if (typeof entry === 'string') return null;
+  const ts = entry.timestamp || entry.time || entry.ts;
+  if (!ts) return null;
+  const ms = typeof ts === 'number' ? ts : Date.parse(ts);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 function isDryRun() {
   const v = String(process.env.DRY_RUN ?? 'true').toLowerCase();
   return v !== 'false';
@@ -87,10 +100,21 @@ function scanLogs(logs) {
   const entries = Array.isArray(logs) ? logs : (logs?.logs || logs?.data || []);
   if (!Array.isArray(entries)) return;
 
+  // Filtrar entries más viejos que el cursor (alta marca de agua).
+  // Logs sin timestamp parseable se procesan igual (no podemos compararlos).
+  let maxTimestampSeen = lastProcessedTimestamp;
+  const entriesFiltradas = entries.filter(entry => {
+    const ts = entryTimestampMs(entry);
+    if (ts === null) return true; // sin timestamp -> procesar
+    if (ts <= lastProcessedTimestamp) return false; // viejo -> skip
+    if (ts > maxTimestampSeen) maxTimestampSeen = ts;
+    return true;
+  });
+
   const ticketDataIndex = [];
   const fallos = [];
 
-  entries.forEach((entry, i) => {
+  entriesFiltradas.forEach((entry, i) => {
     const message = extraerMensaje(entry);
 
     const td = tryParseTicketData(message);
@@ -101,6 +125,12 @@ function scanLogs(logs) {
     const rawPortal = detectarFallo(message);
     if (rawPortal) fallos.push({ position: i, rawPortal });
   });
+
+  // Avanzar cursor solo si hubo logs nuevos (no regresivo)
+  if (maxTimestampSeen > lastProcessedTimestamp) {
+    lastProcessedTimestamp = maxTimestampSeen;
+    console.log(`[REINO B] Cursor avanzado a ${new Date(lastProcessedTimestamp).toISOString()}`);
+  }
 
   if (fallos.length === 0) return;
 
