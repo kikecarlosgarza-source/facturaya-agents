@@ -1,18 +1,33 @@
 // Detector de fallos en logs de Reino A.
-// Pre-pass: indexa todos los `[TICKET] datos extraidos: {JSON}` del batch.
-// Para cada `Portal seleccionado: X` (o `portal no soportado`), busca el
-// ticketData más cercano (dentro de ±30 líneas) y enriquece el payload
-// pasado al orchestrator con establecimiento, folio, fecha, total, rfc_emisor,
-// numero_tienda, portal_facturacion.
+// Detecta el patron "fallida_temporal" emitido por Reino A cuando un portal
+// no tiene handler bespoke. Asocia cada fallo con el ticketData mas cercano
+// (dentro de +-30 lineas) y dispara el orchestrator.
+//
+// Patrones soportados (Reino A commit 7c9b8fd, mayo 2026):
+//   [AUTO] Sin handler bespoke para "X" -> fallida_temporal
+//   [AUTO] PRIMER alert para portal "X"
+//   [AUTO] Portal "X" ya alertado anteriormente - silencio (NO dispara)
+//
+// Patrones legacy mantenidos por compat:
+//   Portal seleccionado: X
+//   portal no soportado: X
 
 const orchestrator = require('./orchestrator');
 
 const PATRONES_FALLO = [
+  // Reino A actual (post commit 7c9b8fd)
+  /\[AUTO\]\s+Sin handler bespoke para\s+"([^"]+)"/i,
+  /\[AUTO\]\s+PRIMER alert para portal\s+"([^"]+)"/i,
+  // Legacy
   /Portal seleccionado:\s*([A-Za-z0-9_-]+)/i,
   /portal no soportado[^A-Za-z]+([A-Za-z0-9_-]+)/i
 ];
+
+// "ya alertado anteriormente" NO es fallo nuevo: dedup ya activo en Reino A.
+const PATRON_YA_ALERTADO = /\[AUTO\]\s+Portal\s+"([^"]+)"\s+ya alertado anteriormente/i;
+
 const PATRON_TICKET_DATA = /\[TICKET\][^\{]*datos extraidos:\s*(\{[\s\S]*?\})\s*$/;
-const VENTANA_MAX = 30; // líneas máx entre ticketData y fallo para considerarlo "cercano"
+const VENTANA_MAX = 30;
 
 const procesados = new Set();
 
@@ -72,7 +87,6 @@ function scanLogs(logs) {
   const entries = Array.isArray(logs) ? logs : (logs?.logs || logs?.data || []);
   if (!Array.isArray(entries)) return;
 
-  // Pre-pass: indexar ticketData y fallos con su posición en el batch.
   const ticketDataIndex = [];
   const fallos = [];
 
@@ -81,6 +95,8 @@ function scanLogs(logs) {
 
     const td = tryParseTicketData(message);
     if (td) ticketDataIndex.push({ position: i, data: td });
+
+    if (PATRON_YA_ALERTADO.test(message)) return;
 
     const rawPortal = detectarFallo(message);
     if (rawPortal) fallos.push({ position: i, rawPortal });
@@ -100,11 +116,10 @@ function scanLogs(logs) {
     console.log(`[REINO B] Fallo detectado: portal=${portal} ticketData=${enriched} key=${key}`);
 
     if (isDryRun()) {
-      console.log(`[REINO B] DRY_RUN=true — no se ejecutan agentes (Scout/Generator/Pusher)`);
+      console.log(`[REINO B] DRY_RUN=true - no se ejecutan agentes (Scout/Generator/Pusher)`);
       continue;
     }
 
-    // Fire-and-forget — no bloquear el scan del resto.
     orchestrator.procesarFallo({
       portal,
       ticketData: ticketData || null,
