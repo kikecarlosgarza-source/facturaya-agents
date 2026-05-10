@@ -55,13 +55,33 @@ async function procesarFallo({ portal, ticketData, rawLogPortal }) {
     return { exito: false, etapa: 'lookup', error: 'URL no encontrada' };
   }
 
-  // 2. DNS pre-check
-  const dnsOk = await dnsCheck.dnsResolves(urlPortal);
+  // 2. DNS pre-check con fallback a portalsLookup
+  let dnsOk = await dnsCheck.dnsResolves(urlPortal);
+  let urlFinal = urlPortal;
+
   if (!dnsOk.ok) {
-    console.error(`[REINO B] DNS no resuelve para ${urlPortal}: ${dnsOk.error}`);
-    return { exito: false, etapa: 'dns', error: dnsOk.error, url: urlPortal };
+    console.warn(`[REINO B] DNS no resuelve para ${urlPortal}: ${dnsOk.error} — intentando fallback portalsLookup`);
+    const urlFallback = await portalsLookup.lookupPortalUrl({
+      portal,
+      establecimiento: ticketData?.establecimiento
+    });
+    if (urlFallback && urlFallback !== urlPortal) {
+      console.log(`[REINO B] Fallback URL: ${urlFallback}`);
+      const dnsFallback = await dnsCheck.dnsResolves(urlFallback);
+      if (dnsFallback.ok) {
+        urlFinal = urlFallback;
+        dnsOk = dnsFallback;
+        console.log(`[REINO B] Fallback DNS OK: ${dnsFallback.host}`);
+      } else {
+        console.error(`[REINO B] Fallback también falla DNS: ${dnsFallback.error}`);
+        return { exito: false, etapa: 'dns', error: `Ambos URLs fallan DNS — ticket: ${dnsOk.error}, fallback: ${dnsFallback.error}`, url: urlPortal, urlFallback };
+      }
+    } else {
+      return { exito: false, etapa: 'dns', error: dnsOk.error, url: urlPortal };
+    }
+  } else {
+    console.log(`[REINO B] DNS OK: ${dnsOk.host}`);
   }
-  console.log(`[REINO B] DNS OK: ${dnsOk.host}`);
 
   // 3. Construir ticketData pasable a scoutVisual (asegurar campos mínimos)
   const ticketDataParaScout = {
@@ -84,7 +104,7 @@ async function procesarFallo({ portal, ticketData, rawLogPortal }) {
   try {
     resultado = await scoutVisual.explorarYFacturar({
       portal,
-      urlPortal,
+      urlPortal: urlFinal,
       ticketData: ticketDataParaScout,
       perfil: PERFIL_DEFAULT
     });
