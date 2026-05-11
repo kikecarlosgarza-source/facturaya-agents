@@ -12,6 +12,7 @@
 const portalsLookup = require('./lib/portalsLookup');
 const dnsCheck = require('./lib/dnsCheck');
 const scoutVisual = require('./agents/scoutVisual');
+const bridgeClient = require('./agents/bridgeClient');
 const generator = require('./agents/generator');
 const pusher = require('./agents/pusher');
 
@@ -100,16 +101,20 @@ async function procesarFallo({ portal, ticketData, rawLogPortal }) {
   // 4. Scout Visual — try/catch defensivo (BUG 1): si scoutVisual lanza
   // una excepción no controlada (e.g. browser crash, OOM, etc.) NO debe
   // matar al daemon completo. Atrapamos y devolvemos resultado estructurado.
+  const engine = bridgeClient.isBridgeEnabled() ? bridgeClient : scoutVisual;
+  const engineName = bridgeClient.isBridgeEnabled() ? 'bridge' : 'scoutVisual';
+  console.log(`[REINO B] motor seleccionado: ${engineName}`);
+
   let resultado;
   try {
-    resultado = await scoutVisual.explorarYFacturar({
+    resultado = await engine.explorarYFacturar({
       portal,
       urlPortal: urlFinal,
       ticketData: ticketDataParaScout,
       perfil: PERFIL_DEFAULT
     });
   } catch (err) {
-    console.error(`[REINO B] scoutVisual lanzó excepción no controlada: ${err.message}`);
+    console.error(`[REINO B] motor ${engineName} lanzó excepción no controlada: ${err.message}`);
     console.error(err.stack);
     return {
       exito: false,
@@ -119,7 +124,12 @@ async function procesarFallo({ portal, ticketData, rawLogPortal }) {
     };
   }
 
-  console.log(`[REINO B] Scout Visual costo: $${resultado.costo.costUsd} (${resultado.costo.calls} calls, ${resultado.costo.inputTokens}+${resultado.costo.outputTokens} tokens)`);
+  const costoSrc = resultado.costo?.source || 'local';
+  if (costoSrc === 'bridge') {
+    console.log(`[REINO B] Scout via bridge: duración ${((resultado.costo.durationMs||0)/1000).toFixed(1)}s requestId=${resultado.bridgeResponse?.requestId || 'n/a'}`);
+  } else {
+    console.log(`[REINO B] Scout Visual costo: $${resultado.costo.costUsd} (${resultado.costo.calls} calls, ${resultado.costo.inputTokens}+${resultado.costo.outputTokens} tokens)`);
+  }
 
   if (!resultado.exito) {
     console.error(`[REINO B] Scout Visual falló: ${resultado.error}`);
