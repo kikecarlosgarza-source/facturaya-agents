@@ -1,14 +1,24 @@
-// Cliente HTTP del bridge Mac (ngrok tunnel)
+// Cliente HTTP del bridge Mac (ngrok tunnel) — modelo async con polling
 // Reemplaza el scout DOM-based local cuando BRIDGE_URL está configurado.
 
 const axios = require('axios');
 
 const BRIDGE_URL = process.env.BRIDGE_URL || '';
-const BRIDGE_TIMEOUT_MS = parseInt(process.env.BRIDGE_TIMEOUT_MS || '720000', 10);
-// Default 12min — el scout real tarda ~1-3min, timbrar puede tomar más
+const BRIDGE_POLL_INTERVAL_MS = parseInt(process.env.BRIDGE_POLL_INTERVAL_MS || '15000', 10);
+const BRIDGE_MAX_POLLS = parseInt(process.env.BRIDGE_MAX_POLLS || '80', 10); // 80 * 15s = 20min total
+const BRIDGE_HTTP_TIMEOUT_MS = parseInt(process.env.BRIDGE_HTTP_TIMEOUT_MS || '30000', 10);
+
+const COMMON_HEADERS = {
+  'Content-Type': 'application/json',
+  'ngrok-skip-browser-warning': 'true'
+};
 
 function isBridgeEnabled() {
   return BRIDGE_URL && /^https?:\/\//.test(BRIDGE_URL);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function explorarYFacturar({ portal, urlPortal, ticketData, perfil }) {
@@ -38,55 +48,89 @@ async function explorarYFacturar({ portal, urlPortal, ticketData, perfil }) {
     mode: 'timbrar'
   };
 
-  console.log(`[BRIDGE_CLIENT] POST ${BRIDGE_URL}/scout portal=${portal} timeout=${BRIDGE_TIMEOUT_MS}ms`);
   const startedAt = Date.now();
+  let requestId = null;
 
   try {
-    const resp = await axios.post(`${BRIDGE_URL}/scout`, payload, {
-      timeout: BRIDGE_TIMEOUT_MS,
-      headers: {
-        'Content-Type': 'application/json',
-        'ngrok-skip-browser-warning': 'true'
-      },
+    // 1. POST async — responde inmediato con requestId
+    console.log(`[BRIDGE_CLIENT] POST ${BRIDGE_URL}/scout portal=${portal}`);
+    const postResp = await axios.post(`${BRIDGE_URL}/scout`, payload, {
+      timeout: BRIDGE_HTTP_TIMEOUT_MS,
+      headers: COMMON_HEADERS,
       maxContentLength: 50 * 1024 * 1024,
       maxBodyLength: 50 * 1024 * 1024
     });
+    requestId = postResp.data?.requestId;
+    if (!requestId) throw new Error('bridge no devolvió requestId');
+    console.log(`[BRIDGE_CLIENT] ${requestId} encolado (status=${postResp.data.status})`);
 
-    const durationMs = Date.now() - startedAt;
-    console.log(`[BRIDGE_CLIENT] respondió en ${(durationMs/1000).toFixed(1)}s success=${resp.data?.success}`);
+    // 2. Loop de polling
+    for (let i = 1; i <= BRIDGE_MAX_POLLS; i++) {
+      await sleep(BRIDGE_POLL_INTERVAL_MS);
+      const statusResp = await axios.get(`${BRIDGE_URL}/status/${requestId}`, {
+        timeout: BRIDGE_HTTP_TIMEOUT_MS,
+        headers: COMMON_HEADERS
+      });
+      const st = statusResp.data?.status;
+      console.log(`[BRIDGE_CLIENT] ${requestId} poll ${i}/${BRIDGE_MAX_POLLS} status=${st}`);
 
-    const parsed = resp.data?.parsed || {};
-
-    return {
-      exito: !!parsed.exito,
-      uuid: parsed.uuid || null,
-      error: parsed.error || (resp.data?.success ? null : 'bridge falló'),
-      accionesGrabadas: parsed.acciones_grabadas || [],
-      screenshots: [],
-      costo: {
-        capUsd: null,
-        costUsd: null,
-        durationMs,
-        source: 'bridge'
-      },
-      bridgeResponse: {
-        requestId: resp.data?.requestId,
-        durationMs: resp.data?.durationMs,
-        log_path: resp.data?.log_path
+      if (st === 'done' || st === 'error') {
+        // 3. Obtener resultado
+        const resultResp = await axios.get(`${BRIDGE_URL}/result/${requestId}`, {
+          timeout: BRIDGE_HTTP_TIMEOUT_MS,
+          headers: COMMON_HEADERS,
+          maxContentLength: 50 * 1024 * 1024
+        });
+        return formatResult(resultResp.data, startedAt, requestId);
       }
-    };
+      // queued | running → siguiente poll
+    }
+
+    // 4. Timeout de polling total
+    const durationMs = Date.now() - startedAt;
+    console.error(`[BRIDGE_CLIENT] ${requestId} polling timeout tras ${BRIDGE_MAX_POLLS} intentos (${(durationMs/1000).toFixed(0)}s)`);
+    return errorResult(`bridge polling timeout tras ${BRIDGE_MAX_POLLS} intentos`, durationMs, requestId);
+
   } catch (err) {
     const durationMs = Date.now() - startedAt;
-    console.error(`[BRIDGE_CLIENT] error en ${(durationMs/1000).toFixed(1)}s: ${err.message}`);
-    return {
-      exito: false,
-      uuid: null,
-      error: `bridge error: ${err.message}`,
-      accionesGrabadas: [],
-      screenshots: [],
-      costo: { source: 'bridge', durationMs }
-    };
+    console.error(`[BRIDGE_CLIENT] error ${requestId || '(sin id)'} en ${(durationMs/1000).toFixed(1)}s: ${err.message}`);
+    return errorResult(`bridge error: ${err.message}`, durationMs, requestId);
   }
+}
+
+function formatResult(data, startedAt, requestId) {
+  const durationMs = Date.now() - startedAt;
+  const parsed = data?.parsed || {};
+  return {
+    exito: !!parsed.exito,
+    uuid: parsed.uuid || null,
+    error: parsed.error || (data?.success ? null : 'bridge falló'),
+    accionesGrabadas: parsed.acciones_grabadas || [],
+    screenshots: [],
+    costo: {
+      capUsd: null,
+      costUsd: null,
+      durationMs,
+      source: 'bridge'
+    },
+    bridgeResponse: {
+      requestId: data?.requestId || requestId,
+      durationMs: data?.durationMs,
+      log_path: data?.log_path
+    }
+  };
+}
+
+function errorResult(msg, durationMs, requestId) {
+  return {
+    exito: false,
+    uuid: null,
+    error: msg,
+    accionesGrabadas: [],
+    screenshots: [],
+    costo: { source: 'bridge', durationMs },
+    bridgeResponse: requestId ? { requestId } : undefined
+  };
 }
 
 module.exports = { explorarYFacturar, isBridgeEnabled };
