@@ -50,7 +50,7 @@ async function chat({ system, messages, model = 'claude-sonnet-4-5-20250929', ma
 // (computer-use-2025-11-24) y otros features beta. Acepta tools y betas
 // además de los params estándar. Devuelve content + stop_reason crudos para
 // que el caller pueda parsear tool_use blocks.
-async function chatBeta({ system, messages, tools, betas, model = 'claude-opus-4-7', maxTokens = 4096 }) {
+async function chatBeta({ system, messages, tools, betas, model = 'claude-opus-4-7', maxTokens = 4096, toolChoice, allowParallelTools = false }) {
   const client = getClient();
   let lastErr;
 
@@ -59,6 +59,14 @@ async function chatBeta({ system, messages, tools, betas, model = 'claude-opus-4
       const params = { model, max_tokens: maxTokens, messages };
       if (system) params.system = system;
       if (tools) params.tools = tools;
+      // Default: prohibir parallel tool calls. Los agentes DOM-based necesitan
+      // que cada acción modifique el DOM antes de decidir la siguiente.
+      // Pasar allowParallelTools=true o toolChoice explícito para opt-out.
+      if (toolChoice) {
+        params.tool_choice = toolChoice;
+      } else if (tools && !allowParallelTools) {
+        params.tool_choice = { type: 'auto', disable_parallel_tool_use: true };
+      }
       if (betas && betas.length > 0) params.betas = betas;
 
       const resp = await client.beta.messages.create(params);
