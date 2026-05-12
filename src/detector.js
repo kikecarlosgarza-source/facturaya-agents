@@ -13,6 +13,12 @@
 //   portal no soportado: X
 
 const orchestrator = require('./orchestrator');
+const reinoAClient = require('./lib/reinoAClient');
+
+// Maximo de intentos por dedup_key. Si Reino A reporta >= este numero de intentos
+// previos sin exito_timbrado, el ticket queda para flujo manual del usuario.
+// Configurable via env, default 2.
+const MAX_INTENTOS_REINO_B = parseInt(process.env.MAX_INTENTOS_REINO_B || '2', 10);
 
 const PATRONES_FALLO = [
   // Patrones LEGACY eliminados (incidente HD 2026-05-11):
@@ -97,7 +103,7 @@ function dedupKey(portal, ticketData, fallback) {
   return `${portal}::${folio}`;
 }
 
-function scanLogs(logs) {
+async function scanLogs(logs) {
   const entries = Array.isArray(logs) ? logs : (logs?.logs || logs?.data || []);
   if (!Array.isArray(entries)) return;
 
@@ -140,6 +146,7 @@ function scanLogs(logs) {
     const portal = normalizarPortalKey(ticketData?.establecimiento, fallo.rawPortal);
     const key = dedupKey(portal, ticketData, fallo.rawPortal);
 
+    // 1. Dedup in-memory del mismo cycle (evita procesar el mismo key 2 veces seguidas)
     if (procesados.has(key)) continue;
     procesados.add(key);
 
@@ -151,12 +158,58 @@ function scanLogs(logs) {
       continue;
     }
 
+    // 2. Dedup persistente: consultar historial en Reino A (sobrevive a reinicios)
+    const historico = await reinoAClient.consultarIntentos(key);
+    if (historico.ya_timbrado) {
+      console.log(`[REINO B] ${key} ya timbrado en intento previo, skip`);
+      continue;
+    }
+    if (historico.total >= MAX_INTENTOS_REINO_B) {
+      console.log(`[REINO B] ${key} alcanzó MAX_INTENTOS_REINO_B (${MAX_INTENTOS_REINO_B}), skip — flujo manual`);
+      continue;
+    }
+    if (historico.total > 0) {
+      console.log(`[REINO B] ${key} intento ${historico.total + 1}/${MAX_INTENTOS_REINO_B} (${historico.total} previos fallidos)`);
+    }
+
+    // 3. Procesar (fire-and-forget) + reportar resultado al endpoint cuando termine
+    const startedAt = Date.now();
     orchestrator.procesarFallo({
       portal,
       ticketData: ticketData || null,
       rawLogPortal: fallo.rawPortal
-    }).catch(err => {
-      console.error(`[REINO B] Orchestrator error: ${err.message}`);
+    }).then(async (resultado) => {
+      const exitoTimbrado = !!(resultado.exito && resultado.uuid);
+      try {
+        await reinoAClient.reportarIntento({
+          solicitudId: key,
+          dedupKey: key,
+          etapa: resultado.etapa || 'unknown',
+          exito: exitoTimbrado,
+          uuidCfdi: resultado.uuid,
+          errorMensaje: resultado.error,
+          costoUsd: resultado.costo?.costUsd,
+          motor: resultado.costo?.source,
+          prUrl: resultado.prUrl,
+          duracionMs: Date.now() - startedAt
+        });
+      } catch (e) {
+        console.warn(`[REINO B] reportarIntento fallo (${key}): ${e.message}`);
+      }
+    }).catch(async (err) => {
+      console.error(`[REINO B] Orchestrator throw (${key}): ${err.message}`);
+      try {
+        await reinoAClient.reportarIntento({
+          solicitudId: key,
+          dedupKey: key,
+          etapa: 'orchestrator-throw',
+          exito: false,
+          errorMensaje: err.message,
+          duracionMs: Date.now() - startedAt
+        });
+      } catch (e) {
+        console.warn(`[REINO B] reportarIntento del throw también fallo (${key}): ${e.message}`);
+      }
     });
   }
 }

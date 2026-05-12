@@ -7,7 +7,7 @@ async function pollOnce() {
   try {
     console.log('[REINO B] Polling logs Render...');
     const logs = await renderApi.getRecentLogs();
-    detector.scanLogs(logs);
+    await detector.scanLogs(logs);
   } catch (err) {
     console.error(`[REINO B] Error en poll: ${err.message}`);
   }
