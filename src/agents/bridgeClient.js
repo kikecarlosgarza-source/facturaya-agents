@@ -101,10 +101,16 @@ async function explorarYFacturar({ portal, urlPortal, ticketData, perfil }) {
 function formatResult(data, startedAt, requestId) {
   const durationMs = Date.now() - startedAt;
   const parsed = data?.parsed || {};
+  // Detectar captcha estructurado del bridge (prompt v2026-05-12) o fallback string-match.
+  // Cuando captchaDetected=true, el orchestrator hace fallback a scoutVisual (que tiene CapSolver).
+  const errStr = String(parsed.error || '');
+  const isCaptcha = parsed.error === 'captcha_detected' || /captcha/i.test(errStr);
   return {
     exito: !!parsed.exito,
     uuid: parsed.uuid || null,
     error: parsed.error || (data?.success ? null : 'bridge falló'),
+    captchaDetected: isCaptcha,
+    tipoCaptcha: parsed.tipo_captcha || null,
     accionesGrabadas: parsed.acciones_grabadas || [],
     screenshots: [],
     costo: {

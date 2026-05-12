@@ -101,12 +101,16 @@ async function procesarFallo({ portal, ticketData, rawLogPortal }) {
   // 4. Scout Visual — try/catch defensivo (BUG 1): si scoutVisual lanza
   // una excepción no controlada (e.g. browser crash, OOM, etc.) NO debe
   // matar al daemon completo. Atrapamos y devolvemos resultado estructurado.
-  const engine = bridgeClient.isBridgeEnabled() ? bridgeClient : scoutVisual;
-  const engineName = bridgeClient.isBridgeEnabled() ? 'bridge' : 'scoutVisual';
+  // Estrategia: bridge primero (claude --print local, costo bajo + acciones grabables).
+  // Si el bridge detecta captcha, fallback automático a scoutVisual que sí
+  // tiene integración con CapSolver via src/lib/capsolver.
+  const useBridgeFirst = bridgeClient.isBridgeEnabled();
+  let engineName = useBridgeFirst ? 'bridge' : 'scoutVisual';
   console.log(`[REINO B] motor seleccionado: ${engineName}`);
 
   let resultado;
   try {
+    const engine = useBridgeFirst ? bridgeClient : scoutVisual;
     resultado = await engine.explorarYFacturar({
       portal,
       urlPortal: urlFinal,
@@ -122,6 +126,30 @@ async function procesarFallo({ portal, ticketData, rawLogPortal }) {
       error: err.message,
       stack: err.stack?.substring(0, 500)
     };
+  }
+
+  // Fallback automático: si bridge falló por captcha detectado, reintentar con scoutVisual.
+  // scoutVisual.js tiene capsolver integrado y resuelve kaptchas tipo imagen.
+  if (useBridgeFirst && !resultado.exito && resultado.captchaDetected) {
+    console.log(`[REINO B] bridge detectó captcha (tipo=${resultado.tipoCaptcha || 'desconocido'}), fallback a scoutVisual`);
+    engineName = 'scoutVisual';
+    try {
+      resultado = await scoutVisual.explorarYFacturar({
+        portal,
+        urlPortal: urlFinal,
+        ticketData: ticketDataParaScout,
+        perfil: PERFIL_DEFAULT
+      });
+    } catch (err) {
+      console.error(`[REINO B] scoutVisual fallback lanzó excepción: ${err.message}`);
+      console.error(err.stack);
+      return {
+        exito: false,
+        etapa: 'scout-fallback-throw',
+        error: err.message,
+        stack: err.stack?.substring(0, 500)
+      };
+    }
   }
 
   const costoSrc = resultado.costo?.source || 'local';
