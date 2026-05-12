@@ -15,12 +15,13 @@
 const orchestrator = require('./orchestrator');
 
 const PATRONES_FALLO = [
-  // Reino A actual (post commit 7c9b8fd)
+  // Patrones LEGACY eliminados (incidente HD 2026-05-11):
+  // /Portal seleccionado:/ y /portal no soportado/ matchaban TODOS los
+  // tickets con handler bespoke → doble facturación. Si en el futuro
+  // necesitamos detectar fallos recuperables de handlers bespoke,
+  // Reino A debe emitir un log nuevo y explícito.
   /\[AUTO\]\s+Sin handler bespoke para\s+"([^"]+)"/i,
-  /\[AUTO\]\s+PRIMER alert para portal\s+"([^"]+)"/i,
-  // Legacy
-  /Portal seleccionado:\s*([A-Za-z0-9_-]+)/i,
-  /portal no soportado[^A-Za-z]+([A-Za-z0-9_-]+)/i
+  /\[AUTO\]\s+PRIMER alert para portal\s+"([^"]+)"/i
 ];
 
 // "ya alertado anteriormente" NO es fallo nuevo: dedup ya activo en Reino A.
