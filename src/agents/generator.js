@@ -20,10 +20,11 @@ const REFS_DIR = path.join(__dirname, '..', 'refs');
 async function leerReferencias() {
   const refSeven = await fs.readFile(path.join(REFS_DIR, 'sevenelevenHandler.ref.js'), 'utf8');
   const refBenavides = await fs.readFile(path.join(REFS_DIR, 'benavidesHandler.ref.js'), 'utf8');
-  return { refSeven, refBenavides };
+  const refOxxoGas = await fs.readFile(path.join(REFS_DIR, 'oxxoGasHandler.ref.js'), 'utf8');
+  return { refSeven, refBenavides, refOxxoGas };
 }
 
-function buildSystemPrompt(refSeven, refBenavides) {
+function buildSystemPrompt(refSeven, refBenavides, refOxxoGas) {
   return [
     'Eres un agente generador de handlers JS para facturación automatizada en portales SAT-México.',
     '',
@@ -55,9 +56,14 @@ function buildSystemPrompt(refSeven, refBenavides) {
     refSeven,
     '```',
     '',
-    'HANDLER DE REFERENCIA 2 (Benavides):',
+    'HANDLER DE REFERENCIA 2 (Benavides, Pattern A — HTTP-only + cookie jar):',
     '```javascript',
     refBenavides,
+    '```',
+    '',
+    'HANDLER DE REFERENCIA 3 (OXXO Gas, Pattern A — HTTP-only + reCAPTCHA v2 CapSolver + verificación post-emisión anti-false-success):',
+    '```javascript',
+    refOxxoGas,
     '```'
   ].join('\n');
 }
@@ -110,7 +116,7 @@ async function generarHandlerDesdeAcciones({ portal, accionesGrabadas, ticketDat
     return { error: `No se pudieron leer handlers de referencia (${REFS_DIR}): ${err.message}` };
   }
 
-  const system = buildSystemPrompt(referencias.refSeven, referencias.refBenavides);
+  const system = buildSystemPrompt(referencias.refSeven, referencias.refBenavides, referencias.refOxxoGas);
   const userMsg = buildUserMessage({ portal, accionesGrabadas, ticketData });
 
   let response;
